@@ -5,8 +5,9 @@ from functools import partial
 import os
 import sqlite3
 import time
+import yaml
+from operator import le, lt, eq, ne, ge, gt
 
-from astropy.time import Time
 from astropy.coordinates import AltAz, SkyCoord
 import astropy.units as u
 from astropy.table import Table
@@ -14,7 +15,6 @@ from astropy.table import Table
 from fact.instrument.constants import LOCATION
 from fact.analysis.source import calc_theta_camera, calc_theta_offs_camera
 from fact.coordinates import camera_to_equatorial, horizontal_to_camera
-from fact.time import to_datetime
 
 from klaas.apply import predict_energy, predict_disp, predict_separator
 from klaas.parallel import parallelize_array_computation
@@ -23,19 +23,20 @@ from klaas.feature_generation import feature_generation
 from klaas.preprocessing import calc_true_disp
 
 #Paths
-gammalimit = 0.85
-thetalimit = 1
-thetalimitexcess = np.sqrt(0.025)
-timeouttime = 5
-configuration_path = 'klaas.yaml'
+gammalimit = 0.84 #Gamma-Cut = 0.84
+thetalimit = 1.0 #Theta-Cut for db = 0.
+thetalimitexcess = 0.16 #Theta-Cut for excess rate = 0.16
+timeouttime = 5 
+configuration_path = 'aict.yaml'
+quality_cuts_path = 'quality_cuts.yaml' 
 separator_model_path = 'separator.pkl' 
-energy_model_path = 'regressor.pkl'
-disp_model_path = 'disp_model.pkl'
-sign_model_path = 'sign_model.pkl'
+energy_model_path = 'energy.pkl'
+disp_model_path = 'disp.pkl'
+sign_model_path = 'sign.pkl'
 data_path = 'Data/'
-data_remove_path = 'Data/done/'
+data_remove_path = 'Data/done1/'
 aux_path = 'Data/AUX/' 
-database_path = 'Online/rtadata.db'
+database_path = 'Online/rta.db'
 fact_sources = 'fact_sources.csv'
     
 #Needed features
@@ -67,6 +68,16 @@ db_features = [
     'source',
 ]
 
+OPERATORS = {
+    '<': lt, 'lt': lt,
+    '<=': le, 'le': le,
+    '==': eq, 'eq': eq,
+    '=': eq,
+    '!=': ne, 'ne': ne,
+    '>': gt, 'gt': gt,
+    '>=': ge, 'ge': ge,
+}
+
 #Load .fit File and start analysis 
 def loadfits():
     filename = [f for f in os.listdir('Data/') if f.endswith('.fits') or f.endswith('.fit')]
@@ -77,6 +88,7 @@ def loadfits():
     time.sleep(timeouttime) 
     loadfits()
 
+#Apply ML Models
 def analysis(file_path):
     #Load paths
     config = KlaasConfig.from_yaml(configuration_path)
@@ -85,7 +97,22 @@ def analysis(file_path):
     disp_model = joblib.load(disp_model_path)
     sign_model = joblib.load(sign_model_path)
     t = Table.read(file_path) 
-    df = t.to_pandas() #Create PandasDataframe
+    dd = t.to_pandas() #Create PandasDataframe
+    
+    #Apply Qualitycuts
+    with open(quality_cuts_path) as f:
+        quality_cuts = yaml.safe_load(f)
+
+    quality_cuts_selection = quality_cuts.get('selection', {})    
+    quality_cuts_mask = np.ones(len(dd), dtype=bool)
+
+    for name, (operator, value) in quality_cuts_selection.items():
+        ncut = OPERATORS[operator](dd[name], value)
+        quality_cuts_mask = np.logical_and(quality_cuts_mask, ncut)
+    
+    df = dd.loc[quality_cuts_mask]
+    df.index = pd.RangeIndex(len(df.index))
+
     columns = set(needed_columns)
     
     for model in ('separator', 'energy', 'disp'):
@@ -98,18 +125,21 @@ def analysis(file_path):
     except (KeyError, OSError) as e:
         source = None
     
+    
     #Gamaness prediction
     df_sep = feature_generation(df, config.separator.feature_generation)
     df['gamma_prediction'] = predict_separator(
-        df_sep[config.separator.features], separator_model,
+            df_sep[config.separator.features], separator_model,
     )
+
     
     #DISP prediction
     df_disp = feature_generation(df, config.disp.feature_generation)
     disp = predict_disp(
         df_disp[config.disp.features], disp_model, sign_model
     )
-
+    
+    
     #Energy prediction
     df_energy = feature_generation(df, config.energy.feature_generation)
     df['gamma_energy_prediction'] = predict_energy(
@@ -174,7 +204,8 @@ def analysis(file_path):
     timefrom = df.timestamp[0]
     timeto = df.timestamp[len(df.timestamp)-1] 
     timebin = (timeto - timefrom).total_seconds() / 3600.0
-
+    
+    
     #Auswahl der Events
     mask_gamma = df['gamma_prediction'] >= gammalimit
     mask_theta = df['theta_deg'] <= thetalimit
@@ -189,21 +220,19 @@ def analysis(file_path):
     on = len(selected.loc[num_theta, db_features])
     off = len(selected.loc[num_theta_off, db_features])
     rate = (on - off*0.2)/(timebin)
-    excess = pd.DataFrame({'rate' : [rate], 'timeto' : [timeto], 'timefrom':[timefrom]})
-    
-    #Write to SQL Database
-    SQL(selected, excess)
+    excess = pd.DataFrame({'source': df.source[0], 'night' : df.night[0], 'run_id' : df.run_id[0], 'rate' : [rate], 'timeto' : [timeto], 'timefrom':[timefrom], 'n_on' : on, 'n_off' : off})
+    sql(selected, excess)
 
-def SQL(selected, excess):
-    conn = sqlite3.connect(database_path)  # Opens file if exists, else creates file
-    cur = conn.cursor()  # This object lets us actually send messages to our DB and receive results
-    cur.execute('''CREATE TABLE IF NOT EXISTS data (dec_prediction real, event_num integer, gamma_energy_prediction real, gamma_prediction real, night integer, ra_prediction real, run_id integer, theta_deg real, theta_deg_off_1 real, theta_deg_off_2 real, theta_deg_off_3 real, theta_deg_off_4 real, theta_deg_off_5 real, timestamp text, source text)''')    
-    selected.to_sql(name="data", con=conn, if_exists="append", index=False)
-    cur.execute('''CREATE TABLE IF NOT EXISTS excess (rate real, timefrom text, timeto text)''')    
-    excess.to_sql(name="excess", con=conn, if_exists="append", index=False)
+def sql(selected, excess):
+    conn = sqlite3.connect(database_path)  
+    cur = conn.cursor()  
+    cur.execute('''CREATE TABLE IF NOT EXISTS events (dec_prediction real, event_num integer, gamma_energy_prediction real, gamma_prediction real, night integer, ra_prediction real, run_id integer, theta_deg real, theta_deg_off_1 real, theta_deg_off_2 real, theta_deg_off_3 real, theta_deg_off_4 real, theta_deg_off_5 real, timestamp text, source text)''')    
+    selected.to_sql(name="events", con=conn, if_exists="append", index=False)
+    cur.execute('''CREATE TABLE IF NOT EXISTS run (source text, night integer, run_id integer, rate real, timefrom text, timeto text, n_on integer, n_off integer)''')    
+    excess.to_sql(name="run", con=conn, if_exists="append", index=False)
     conn.close()
 
-
+#Sourcename from CSV
 def sourcename(source_x, source_y, pointing_zd, pointing_az, timestamp):
     sourceList = camera_to_equatorial(
         source_x,
@@ -214,14 +243,11 @@ def sourcename(source_x, source_y, pointing_zd, pointing_az, timestamp):
     )
     source = SkyCoord(15*sourceList[0], sourceList[1], unit="deg")
     df = pd.read_csv('fact_sources.csv')
-
     names = list(df.fSourceName)
-
     catalog = SkyCoord(
             ra=df.fRightAscension.values * u.hourangle,
             dec=df.fDeclination.values * u.deg,
             )
-
     idx, sep, dst = source.match_to_catalog_sky(catalog)
     return names[idx]
 
@@ -236,7 +262,6 @@ def concat_results_altaz(results):
         az=np.concatenate([s.az.deg for s in results]) * u.deg,
         frame=AltAz(location=LOCATION, obstime=obstime)
     )
-
 
 def calc_source_features_common(
     source_x,
@@ -323,4 +348,5 @@ def calc_source_features_obs(
     )
     return result
 
-loadfits()
+if __name__ == '__main__':
+    loadfits()
